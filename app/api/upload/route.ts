@@ -1,5 +1,8 @@
 import { NextResponse } from "next/server";
 
+// Edge runtime streams the request body directly to the backend — no 4.5 MB serverless limit.
+export const runtime = "edge";
+
 const BACKEND = process.env.BACKEND_URL ?? "http://127.0.0.1:8000";
 
 export async function POST(req: Request) {

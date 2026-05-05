@@ -21,6 +21,7 @@
     "paths": {
       "@/*": ["./*"]
     },
+    "types": ["node"],
     "plugins": [
       {
         "name": "next"
