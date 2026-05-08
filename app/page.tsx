@@ -13,6 +13,19 @@ type Doc = {
   chunks_indexed?: number;
   ocr_requested_pages?: number;
   ocr_filled_pages?: number;
+  locked?: boolean;
+};
+
+type JobStatus = "queued" | "processing" | "done" | "error";
+
+type JobState = {
+  job_id: string;
+  document_id: string;
+  filename: string;
+  status: JobStatus;
+  progress: string;
+  percent: number;
+  error?: string;
 };
 
 type ChatMsg = { role: "user" | "assistant"; content: string };
@@ -33,6 +46,16 @@ type LlmStats = {
 
 const API_BASE = "/api";
 
+function calcPercent(status: string, progress: string): number {
+  if (status === "done") return 100;
+  if (status === "error") return 0;
+  if (status === "queued") return 8;
+  const p = progress.toLowerCase();
+  if (p.includes("ocr") || p.includes("parsing")) return 35;
+  if (p.includes("embed") || p.includes("index")) return 75;
+  return 15;
+}
+
 export default function Home() {
   const router = useRouter();
   const [docs, setDocs] = useState<Doc[]>([]);
@@ -40,13 +63,15 @@ export default function Home() {
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [selectedDocIds, setSelectedDocIds] = useState<Set<string>>(new Set());
   const [filesPanelOpen, setFilesPanelOpen] = useState(false);
+  const [activeJobs, setActiveJobs] = useState<Map<string, JobState>>(new Map());
+  const pollTimers = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
   const [llmStats, setLlmStats] = useState<LlmStats | null>(null);
   const [llmRate, setLlmRate] = useState<{ rpm: number; tpm: number } | null>(null);
   const [messages, setMessages] = useState<ChatMsg[]>([
     {
       role: "assistant",
       content:
-        "Upload one or more PDFs, then ask a question. I’ll answer using the information available across all uploaded files."
+        "Upload one or more PDFs, then ask a question. I'll answer using the information available across all uploaded files."
     }
   ]);
   const [q, setQ] = useState("");
@@ -59,20 +84,85 @@ export default function Home() {
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
   const docsLabel = useMemo(() => {
-    if (docs.length === 0) return "No PDFs uploaded yet";
-    return `${docs.length} PDF${docs.length === 1 ? "" : "s"} indexed`;
-  }, [docs.length]);
+    if (docs.length === 0 && activeJobs.size === 0) return "No PDFs uploaded yet";
+    const total = docs.length + activeJobs.size;
+    return `${total} PDF${total === 1 ? "" : "s"}`;
+  }, [docs.length, activeJobs.size]);
 
   async function refreshDocs() {
     const res = await fetch(`${API_BASE}/documents`);
     if (!res.ok) return;
     const data = (await res.json()) as { documents: Doc[] };
-    setDocs(data.documents ?? []);
-    // Default behavior: all files selected.
+    const fetched = data.documents ?? [];
+    setDocs(fetched);
     setSelectedDocIds((prev) => {
-      if (prev.size > 0) return prev;
-      return new Set((data.documents ?? []).map((d) => d.document_id));
+      if (prev.size === 0) return new Set(fetched.map((d) => d.document_id));
+      // auto-select newly finished docs
+      const next = new Set(prev);
+      for (const d of fetched) {
+        if (!prev.has(d.document_id)) next.add(d.document_id);
+      }
+      return next;
     });
+  }
+
+  function startPolling(job_id: string, filename: string, document_id: string) {
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/upload/${job_id}`);
+        if (!res.ok) return;
+        const job = (await res.json()) as {
+          status: string;
+          progress?: string;
+          document_id?: string;
+          error?: string;
+        };
+        const status = job.status as JobStatus;
+        const progress = job.progress ?? "";
+        const percent = calcPercent(status, progress);
+        const doc_id = job.document_id ?? document_id;
+
+        setActiveJobs((prev) => {
+          const next = new Map(prev);
+          next.set(job_id, { job_id, document_id: doc_id, filename, status, progress, percent, error: job.error });
+          return next;
+        });
+
+        if (status === "done" || status === "error") {
+          clearInterval(timer);
+          pollTimers.current.delete(job_id);
+          if (status === "done") {
+            await refreshDocs();
+            setActiveJobs((prev) => {
+              const next = new Map(prev);
+              next.delete(job_id);
+              return next;
+            });
+          }
+        }
+      } catch {
+        // keep polling on transient network errors
+      }
+    }, 2000);
+
+    pollTimers.current.set(job_id, timer);
+  }
+
+  async function handleDelete(doc_id: string) {
+    if (!confirm("Delete this document? This cannot be undone.")) return;
+    const res = await fetch(`${API_BASE}/documents/${doc_id}`, { method: "DELETE" });
+    if (res.ok) {
+      setSelectedDocIds((prev) => { const n = new Set(prev); n.delete(doc_id); return n; });
+      await refreshDocs();
+    } else {
+      const err = await res.json().catch(() => ({}));
+      alert((err as { detail?: string }).detail ?? "Failed to delete document");
+    }
+  }
+
+  async function handleToggleLock(doc_id: string) {
+    const res = await fetch(`${API_BASE}/documents/${doc_id}/lock`, { method: "PATCH" });
+    if (res.ok) await refreshDocs();
   }
 
   async function refreshSession() {
@@ -89,6 +179,14 @@ export default function Home() {
   useEffect(() => {
     refreshSession();
     refreshDocs();
+  }, []);
+
+  // Clean up all poll timers on unmount
+  useEffect(() => {
+    return () => {
+      pollTimers.current.forEach((t) => clearInterval(t));
+      pollTimers.current.clear();
+    };
   }, []);
 
   useEffect(() => {
@@ -131,19 +229,48 @@ export default function Home() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages.length]);
 
-  async function onUpload(file: File) {
+  async function onUpload(files: FileList | File[]) {
     setUploading(true);
     try {
-      const fd = new FormData();
-      fd.append("file", file);
-      const res = await fetch(`${API_BASE}/upload`, { method: "POST", body: fd });
-      const body = await res.json().catch(() => ({}));
-      if (res.status === 401) {
-        router.replace("/signin");
-        throw new Error("Not signed in");
+      for (const file of Array.from(files)) {
+        const fd = new FormData();
+        fd.append("file", file);
+        const res = await fetch(`${API_BASE}/upload`, { method: "POST", body: fd });
+        const body = await res.json().catch(() => ({})) as {
+          job_id?: string;
+          document_id?: string;
+          status?: string;
+          detail?: string;
+        };
+        if (res.status === 401) {
+          router.replace("/signin");
+          throw new Error("Not signed in");
+        }
+        if (!res.ok) throw new Error(body?.detail ?? `Upload failed: ${file.name}`);
+
+        const job_id = body.job_id;
+        const document_id = body.document_id ?? "";
+
+        if (body.status === "done" || !job_id) {
+          // Deduped or already complete — just refresh
+          await refreshDocs();
+        } else {
+          // Show immediately in sidebar with 0% and start polling
+          setActiveJobs((prev) => {
+            const next = new Map(prev);
+            next.set(job_id, {
+              job_id,
+              document_id,
+              filename: file.name,
+              status: "queued",
+              progress: "Queued…",
+              percent: 8,
+            });
+            return next;
+          });
+          startPolling(job_id, file.name, document_id);
+        }
       }
-      if (!res.ok) throw new Error(body?.detail ?? "Upload failed");
-      await refreshDocs();
     } finally {
       setUploading(false);
     }
@@ -164,11 +291,7 @@ export default function Home() {
       const res = await fetch(`${API_BASE}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          question,
-          history,
-          document_ids
-        })
+        body: JSON.stringify({ question, history, document_ids })
       });
       const body = await res.json().catch(() => ({}));
       if (res.status === 401) {
@@ -196,14 +319,11 @@ export default function Home() {
     void send();
   }
 
+  // Doc IDs currently being processed — hide from completed list to avoid duplicates
+  const activeDocIds = new Set(Array.from(activeJobs.values()).map((j) => j.document_id));
+
   return (
-    <div
-      style={{
-        display: "grid",
-        gridTemplateColumns: "320px 1fr",
-        height: "100vh"
-      }}
-    >
+    <div style={{ display: "grid", gridTemplateColumns: "320px 1fr", height: "100vh" }}>
       <aside
         style={{
           borderRight: "1px solid rgba(255,255,255,0.08)",
@@ -229,83 +349,113 @@ export default function Home() {
               fontSize: 14
             }}
           >
-            {uploading ? "Uploading…" : "Upload PDF"}
+            {uploading ? "Uploading…" : "Upload PDFs"}
             <input
               type="file"
               accept="application/pdf"
+              multiple
               disabled={uploading}
               style={{ display: "none" }}
               onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) onUpload(f);
+                const files = e.target.files;
+                if (files && files.length > 0) void onUpload(files);
                 e.currentTarget.value = "";
               }}
             />
           </label>
 
-          <div style={{ display: "flex", gap: 8 }}>
-            <button
-              type="button"
-              onClick={() => setSelectedDocIds(new Set(docs.map((d) => d.document_id)))}
-              disabled={docs.length === 0}
-              style={{
-                flex: 1,
-                padding: "8px 10px",
-                borderRadius: 10,
-                border: "1px solid rgba(255,255,255,0.12)",
-                background: docs.length === 0 ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.03)",
-                color: "inherit",
-                cursor: docs.length === 0 ? "not-allowed" : "pointer",
-                fontSize: 12,
-                fontWeight: 700
-              }}
-              title="Use all PDFs for chat"
-            >
-              Select all
-            </button>
-            <button
-              type="button"
-              onClick={() => setSelectedDocIds(new Set())}
-              disabled={docs.length === 0}
-              style={{
-                flex: 1,
-                padding: "8px 10px",
-                borderRadius: 10,
-                border: "1px solid rgba(255,255,255,0.12)",
-                background: docs.length === 0 ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.03)",
-                color: "inherit",
-                cursor: docs.length === 0 ? "not-allowed" : "pointer",
-                fontSize: 12,
-                fontWeight: 700
-              }}
-              title="Clear selection (defaults back to all PDFs)"
-            >
-              Deselect all
-            </button>
-          </div>
-
           <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 8 }}>
-            {docs.map((d) => (
+
+            {/* In-progress uploads */}
+            {Array.from(activeJobs.values()).map((job) => (
               <div
-                key={d.document_id}
+                key={job.job_id}
                 style={{
                   padding: 10,
                   borderRadius: 10,
-                  border: "1px solid rgba(255,255,255,0.08)",
-                  background: "rgba(0,0,0,0.18)"
+                  border: `1px solid ${job.status === "error" ? "rgba(255,80,80,0.35)" : "rgba(72,116,255,0.3)"}`,
+                  background: job.status === "error" ? "rgba(255,80,80,0.06)" : "rgba(72,116,255,0.07)"
                 }}
               >
-                <div style={{ fontSize: 13, fontWeight: 600, lineHeight: 1.3 }}>
-                  {d.filename}
+                <div
+                  style={{
+                    fontSize: 13,
+                    fontWeight: 600,
+                    lineHeight: 1.3,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap"
+                  }}
+                  title={job.filename}
+                >
+                  {job.filename}
                 </div>
-                <div style={{ fontSize: 12, opacity: 0.75, marginTop: 4 }}>
-                  {d.page_count ?? "?"} pages · {d.chunks_indexed ?? "?"} chunks
-                </div>
-                <div style={{ fontSize: 12, opacity: 0.65, marginTop: 2 }}>
-                  OCR filled: {d.ocr_filled_pages ?? 0}/{d.ocr_requested_pages ?? 0}
-                </div>
+                {job.status === "error" ? (
+                  <div style={{ fontSize: 12, color: "rgba(255,110,110,0.9)", marginTop: 4 }}>
+                    {job.error ?? job.progress}
+                  </div>
+                ) : (
+                  <>
+                    <div
+                      style={{
+                        fontSize: 11,
+                        opacity: 0.65,
+                        marginTop: 4,
+                        display: "flex",
+                        justifyContent: "space-between"
+                      }}
+                    >
+                      <span>{job.progress}</span>
+                      <span style={{ fontWeight: 700 }}>{job.percent}%</span>
+                    </div>
+                    <div
+                      style={{
+                        marginTop: 5,
+                        height: 3,
+                        borderRadius: 2,
+                        background: "rgba(255,255,255,0.08)",
+                        overflow: "hidden"
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: `${job.percent}%`,
+                          height: "100%",
+                          background: "rgba(72,116,255,0.85)",
+                          borderRadius: 2,
+                          transition: "width 0.6s ease"
+                        }}
+                      />
+                    </div>
+                  </>
+                )}
               </div>
             ))}
+
+            {/* Completed docs */}
+            {docs
+              .filter((d) => !activeDocIds.has(d.document_id))
+              .map((d) => (
+                <div
+                  key={d.document_id}
+                  style={{
+                    padding: 10,
+                    borderRadius: 10,
+                    border: "1px solid rgba(255,255,255,0.08)",
+                    background: "rgba(0,0,0,0.18)"
+                  }}
+                >
+                  <div style={{ fontSize: 13, fontWeight: 600, lineHeight: 1.3 }}>
+                    {d.filename}
+                  </div>
+                  <div style={{ fontSize: 12, opacity: 0.75, marginTop: 4 }}>
+                    {d.page_count ?? "?"} pages · {d.chunks_indexed ?? "?"} chunks
+                  </div>
+                  <div style={{ fontSize: 12, opacity: 0.65, marginTop: 2 }}>
+                    OCR filled: {d.ocr_filled_pages ?? 0}/{d.ocr_requested_pages ?? 0}
+                  </div>
+                </div>
+              ))}
           </div>
         </div>
       </aside>
@@ -321,9 +471,7 @@ export default function Home() {
           }}
         >
           <div style={{ fontSize: 18, fontWeight: 650 }}>Chat</div>
-          <div style={{ fontSize: 12, opacity: 0.7 }}>
-            Searches across all uploaded PDFs
-          </div>
+          <div style={{ fontSize: 12, opacity: 0.7 }}>Searches across all uploaded PDFs</div>
           <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10, position: "relative" }}>
             {llmRate ? (
               <div
@@ -347,8 +495,7 @@ export default function Home() {
                 {Math.round(llmRate.rpm)} req/min · {Math.round(llmRate.tpm)} tok/min
                 {llmStats?.rolling_60s ? (
                   <span style={{ opacity: 0.75 }}>
-                    {" "}
-                    | 60s: {llmStats.rolling_60s.rpm ?? 0} RPM · {llmStats.rolling_60s.tpm_total_est ?? 0} TPM
+                    {" "}| 60s: {llmStats.rolling_60s.rpm ?? 0} RPM · {llmStats.rolling_60s.tpm_total_est ?? 0} TPM
                   </span>
                 ) : null}
               </div>
@@ -425,7 +572,7 @@ export default function Home() {
                   {docs.map((d) => {
                     const checked = selectedDocIds.has(d.document_id);
                     return (
-                      <label
+                      <div
                         key={d.document_id}
                         style={{
                           display: "flex",
@@ -435,7 +582,6 @@ export default function Home() {
                           borderRadius: 12,
                           border: "1px solid rgba(255,255,255,0.08)",
                           background: checked ? "rgba(72, 116, 255, 0.14)" : "rgba(255,255,255,0.03)",
-                          cursor: "pointer"
                         }}
                       >
                         <input
@@ -449,17 +595,46 @@ export default function Home() {
                               return next;
                             });
                           }}
-                          style={{ marginTop: 2 }}
+                          style={{ marginTop: 4, cursor: "pointer", flexShrink: 0 }}
                         />
-                        <div style={{ minWidth: 0 }}>
+                        <div style={{ minWidth: 0, flex: 1 }}>
                           <div style={{ fontSize: 13, fontWeight: 650, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                             {d.filename}
                           </div>
                           <div style={{ fontSize: 12, opacity: 0.75, marginTop: 2 }}>
                             {d.page_count ?? "?"} pages · {d.chunks_indexed ?? "?"} chunks
+                            {(d.ocr_requested_pages ?? 0) > 0 && (
+                              <span style={{ marginLeft: 6, opacity: 0.6 }}>
+                                · OCR {d.ocr_filled_pages}/{d.ocr_requested_pages}
+                              </span>
+                            )}
                           </div>
                         </div>
-                      </label>
+                        <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                          <button
+                            title={d.locked ? "Unlock document" : "Lock document"}
+                            onClick={() => handleToggleLock(d.document_id)}
+                            style={{
+                              background: "none", border: "none", cursor: "pointer",
+                              fontSize: 14, opacity: 0.7, padding: "2px 4px", color: "inherit"
+                            }}
+                          >
+                            {d.locked ? "🔒" : "🔓"}
+                          </button>
+                          {!d.locked && (
+                            <button
+                              title="Delete document"
+                              onClick={() => handleDelete(d.document_id)}
+                              style={{
+                                background: "none", border: "none", cursor: "pointer",
+                                fontSize: 14, opacity: 0.7, padding: "2px 4px", color: "inherit"
+                              }}
+                            >
+                              🗑️
+                            </button>
+                          )}
+                        </div>
+                      </div>
                     );
                   })}
                 </div>
@@ -502,10 +677,7 @@ export default function Home() {
             {messages.map((m, idx) => (
               <div
                 key={idx}
-                style={{
-                  alignSelf: m.role === "user" ? "flex-end" : "flex-start",
-                  maxWidth: "95%"
-                }}
+                style={{ alignSelf: m.role === "user" ? "flex-end" : "flex-start", maxWidth: "95%" }}
               >
                 <div
                   style={{
@@ -513,19 +685,11 @@ export default function Home() {
                     borderRadius: 12,
                     lineHeight: 1.4,
                     border: "1px solid rgba(255,255,255,0.10)",
-                    background:
-                      m.role === "user"
-                        ? "rgba(72, 116, 255, 0.18)"
-                        : "rgba(255,255,255,0.04)"
+                    background: m.role === "user" ? "rgba(72, 116, 255, 0.18)" : "rgba(255,255,255,0.04)"
                   }}
                 >
                   {m.role === "assistant" ? (
-                    <div
-                      style={{
-                        color: "#e7eefc"
-                      }}
-                      className="md"
-                    >
+                    <div style={{ color: "#e7eefc" }} className="md">
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
                     </div>
                   ) : (
@@ -586,15 +750,7 @@ export default function Home() {
             </button>
           </div>
           {disambiguation ? (
-            <div
-              style={{
-                marginTop: 10,
-                maxWidth: 920,
-                display: "flex",
-                flexWrap: "wrap",
-                gap: 8
-              }}
-            >
+            <div style={{ marginTop: 10, maxWidth: 920, display: "flex", flexWrap: "wrap", gap: 8 }}>
               {disambiguation.options.map((o) => (
                 <button
                   key={o.document_id}
